@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: quiz-cloner-service
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: SECRET_TOKEN
+        generateValue: true
+      - key: NODE_ENV
+        value: production
