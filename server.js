@@ -1,6 +1,5 @@
 const express = require('express');
-const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -438,10 +437,17 @@ app.post('/render', async (req, res) => {
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: chromium.args,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+      ],
       defaultViewport: { width: 390, height: 844, deviceScaleFactor: 2, isMobile: true },
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
     });
 
     const page = await browser.newPage();
