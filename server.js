@@ -18,12 +18,205 @@ app.use((req, res, next) => {
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Wait until page title/content stabilizes (no DOM mutations for 600ms)
-async function waitForStable(page, timeout = 8000) {
+// ─── Strategy 1: Intercept CryptoJS + fetch before page loads ─────────────────
+// Catches Inlead (AES-encrypted __NEXT_DATA__) and REST-API platforms
+const INTERCEPT_SCRIPT = `
+(function() {
+  window.__quizCapture = { data: null, source: null };
+
+  function looksLikeQuiz(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    // Direct steps array
+    if (Array.isArray(obj.steps) && obj.steps.length > 0) return true;
+    // Nested: funnel.steps, quiz.steps, pageProps.funnel.steps, etc.
+    for (const key of ['funnel', 'quiz', 'survey', 'form', 'pageProps']) {
+      if (obj[key] && Array.isArray(obj[key].steps) && obj[key].steps.length > 0) return true;
+    }
+    return false;
+  }
+
+  function tryCapture(data, source) {
+    if (window.__quizCapture.data) return; // already captured
+    try {
+      const obj = typeof data === 'string' ? JSON.parse(data) : data;
+      if (looksLikeQuiz(obj)) {
+        window.__quizCapture.data = obj;
+        window.__quizCapture.source = source;
+      }
+    } catch {}
+  }
+
+  // ── Intercept CryptoJS AES decrypt (Inlead, Cakto, etc.) ──
+  function patchCryptoJS(CJ) {
+    if (!CJ || !CJ.AES || CJ.__patched) return;
+    CJ.__patched = true;
+    const orig = CJ.AES.decrypt.bind(CJ.AES);
+    CJ.AES.decrypt = function(ciphertext, key, cfg) {
+      const result = orig(ciphertext, key, cfg);
+      try {
+        const plain = result.toString(CJ.enc.Utf8);
+        if (plain.startsWith('{') || plain.startsWith('[')) {
+          tryCapture(plain, 'cryptojs');
+        }
+      } catch {}
+      return result;
+    };
+  }
+
+  // Watch for CryptoJS being set on window
+  let _cj;
+  Object.defineProperty(window, 'CryptoJS', {
+    configurable: true,
+    get() { return _cj; },
+    set(v) {
+      _cj = v;
+      setTimeout(() => patchCryptoJS(v), 0);
+    },
+  });
+
+  // ── Intercept fetch (REST API platforms) ──
+  const origFetch = window.fetch;
+  window.fetch = async function(...args) {
+    const res = await origFetch.apply(this, args);
+    if (!window.__quizCapture.data) {
+      res.clone().json().then(d => tryCapture(d, 'fetch')).catch(() => {});
+    }
+    return res;
+  };
+
+  // ── Intercept XHR ──
+  const origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(...args) {
+    this.addEventListener('load', () => {
+      if (!window.__quizCapture.data) {
+        tryCapture(this.responseText, 'xhr');
+      }
+    });
+    return origSend.apply(this, args);
+  };
+})();
+`;
+
+// ─── Map captured quiz data to our step format ────────────────────────────────
+function mapCapturedSteps(capturedData) {
+  // Find the steps array wherever it lives
+  let rawSteps =
+    capturedData.steps ||
+    capturedData.funnel?.steps ||
+    capturedData.quiz?.steps ||
+    capturedData.survey?.steps ||
+    capturedData.pageProps?.funnel?.steps ||
+    capturedData.pageProps?.steps ||
+    null;
+
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) return null;
+
+  return rawSteps.map((s) => {
+    // Normalize: different platforms use different field names
+    const title =
+      s.title || s.question || s.heading || s.name || s.label || '';
+    const subtitle =
+      s.subtitle || s.description || s.subheading || s.body || '';
+    const heroImageUrl =
+      s.heroImageUrl || s.imageUrl || s.image?.url || s.background_image || null;
+
+    // Options: could be options[], choices[], answers[], alternatives[]
+    const rawOpts =
+      s.options || s.choices || s.answers || s.alternatives || s.items || [];
+    const options = rawOpts.map((o) => {
+      if (typeof o === 'string') return { text: o, emoji: null, imageUrl: null };
+      return {
+        text: o.text || o.label || o.value || o.title || '',
+        emoji: o.emoji || null,
+        imageUrl: o.imageUrl || o.image?.url || o.image || null,
+      };
+    });
+
+    // Detect type
+    const hasEmail = !!(s.fields || s.inputs || []).find?.(f =>
+      (f.type || '').includes('email') || (f.name || '').includes('email')
+    );
+    let type = s.type || s.stepType || s.kind || 'single-choice';
+
+    // Normalize type names
+    if (/lead|capture|form|email|contato/i.test(type) || hasEmail) type = 'lead-capture';
+    else if (/content|info|landing|page|pg|result/i.test(type)) type = 'content';
+    else if (/multi/i.test(type)) type = 'multiple-choice';
+    else if (options.length >= 2) type = 'single-choice';
+    else type = 'content';
+
+    const leadFields = type === 'lead-capture'
+      ? (s.fields || s.inputs || s.leadFields || []).map((f) => ({
+          label: f.label || f.placeholder || f.name || '',
+          fieldType: /email/i.test(f.type || f.name || '') ? 'email'
+            : /nome|name/i.test(f.name || f.placeholder || '') ? 'name'
+            : /phone|fone|whatsapp|tel/i.test(f.name || f.placeholder || '') ? 'phone'
+            : 'custom',
+        }))
+      : undefined;
+
+    return { type, title, subtitle, heroImageUrl, options, leadFields, screenshot: null };
+  });
+}
+
+// ─── Strategy 2: Extract from React fiber (fallback for SSR/hydrated apps) ────
+async function extractFromReactFiber(page) {
+  return page.evaluate(() => {
+    function looksLikeQuiz(obj) {
+      if (!obj || typeof obj !== 'object') return false;
+      for (const key of ['steps', 'funnel', 'quiz', 'survey']) {
+        const v = obj[key];
+        if (Array.isArray(v) && v.length > 0) return true;
+        if (v && Array.isArray(v.steps) && v.steps.length > 0) return true;
+      }
+      return false;
+    }
+
+    function searchObj(obj, depth) {
+      if (!obj || typeof obj !== 'object' || depth > 6) return null;
+      if (looksLikeQuiz(obj)) return obj;
+      for (const key of Object.keys(obj)) {
+        try {
+          const found = searchObj(obj[key], depth + 1);
+          if (found) return found;
+        } catch {}
+      }
+      return null;
+    }
+
+    function traverseFiber(fiber, depth) {
+      if (!fiber || depth > 80) return null;
+      try {
+        if (fiber.memoizedProps) {
+          const found = searchObj(fiber.memoizedProps, 0);
+          if (found) return found;
+        }
+      } catch {}
+      try {
+        let s = fiber.memoizedState;
+        while (s) {
+          const found = searchObj(s.memoizedState, 0) || searchObj(s.queue?.lastRenderedState, 0);
+          if (found) return found;
+          s = s.next;
+        }
+      } catch {}
+      return traverseFiber(fiber.child, depth + 1) || traverseFiber(fiber.sibling, depth + 1);
+    }
+
+    const root = document.getElementById('__next') || document.getElementById('root') || document.body;
+    const fiberKey = Object.keys(root).find(k =>
+      k.startsWith('__reactFiber') || k.startsWith('__reactInternals') || k.startsWith('__reactContainer')
+    );
+    if (!fiberKey) return null;
+    return traverseFiber(root[fiberKey], 0);
+  });
+}
+
+// ─── Strategy 3: Step-by-step Puppeteer navigation (universal fallback) ───────
+
+async function waitForStable(page, timeout = 6000) {
   await Promise.race([
     page.evaluate(() => new Promise((resolve) => {
       let timer;
@@ -32,43 +225,27 @@ async function waitForStable(page, timeout = 8000) {
         timer = setTimeout(resolve, 600);
       });
       observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-      // Safety: resolve after 4s even if still mutating
       setTimeout(resolve, 4000);
     })),
     delay(timeout),
   ]);
 }
 
-// Get the primary visible text of the current step
 async function getCurrentStepSignature(page) {
   return page.evaluate(() => {
-    const selectors = [
-      'h1', 'h2',
-      '[class*="question"]', '[class*="title"]', '[class*="step-title"]',
-      '[class*="quiz-title"]', '[class*="pergunta"]',
-    ];
+    const selectors = ['h1', 'h2', '[class*="question"]', '[class*="title"]', '[class*="step-title"]'];
     for (const sel of selectors) {
       const el = document.querySelector(sel);
-      if (el) {
-        const text = el.innerText?.trim();
-        if (text && text.length > 2) return text;
-      }
+      const text = el?.innerText?.trim();
+      if (text && text.length > 2) return text;
     }
-    // Fallback: first meaningful text node
     return document.body.innerText?.trim()?.slice(0, 100) || '';
   });
 }
 
-// Extract all data from the currently visible step
 async function extractCurrentStep(page) {
   return page.evaluate(() => {
-    // ── Title ──
-    const titleSelectors = [
-      'h1', 'h2',
-      '[class*="question"]', '[class*="title"]',
-      '[class*="quiz-title"]', '[class*="step-title"]',
-      '[class*="heading"]',
-    ];
+    const titleSelectors = ['h1', 'h2', '[class*="question"]', '[class*="title"]', '[class*="heading"]'];
     let title = '';
     for (const sel of titleSelectors) {
       const el = document.querySelector(sel);
@@ -76,11 +253,7 @@ async function extractCurrentStep(page) {
       if (text && text.length > 2) { title = text; break; }
     }
 
-    // ── Subtitle / description ──
-    const subtitleSelectors = [
-      '[class*="subtitle"]', '[class*="description"]', '[class*="subheading"]',
-      'p:not(:empty)',
-    ];
+    const subtitleSelectors = ['[class*="subtitle"]', '[class*="description"]', 'p:not(:empty)'];
     let subtitle = '';
     for (const sel of subtitleSelectors) {
       const el = document.querySelector(sel);
@@ -88,78 +261,48 @@ async function extractCurrentStep(page) {
       if (text && text.length > 2 && text !== title) { subtitle = text; break; }
     }
 
-    // ── Options ──
     const optionSelectors = [
-      '[class*="option"]:not([class*="selected"]):not([disabled])',
-      '[class*="choice"]',
-      '[class*="answer"]',
-      '[class*="alternative"]',
-      '[role="radio"]', '[role="checkbox"]',
-      '[class*="quiz-btn"]:not([class*="back"]):not([class*="prev"])',
+      '[class*="option"]:not([class*="selected"]):not([disabled])', '[class*="choice"]',
+      '[class*="answer"]', '[class*="alternative"]', '[role="radio"]', '[role="checkbox"]',
     ];
     let options = [];
     for (const sel of optionSelectors) {
       const els = Array.from(document.querySelectorAll(sel));
       const texts = els
-        .map((el) => {
-          const text = el.innerText?.trim().replace(/\s+/g, ' ');
-          const img = el.querySelector('img');
-          return text ? { text, imageUrl: img?.src || null } : null;
-        })
-        .filter((o) => o && o.text.length > 0 && o.text.length < 300);
+        .map((el) => ({ text: el.innerText?.trim().replace(/\s+/g, ' '), imageUrl: el.querySelector('img')?.src || null }))
+        .filter((o) => o.text && o.text.length > 0 && o.text.length < 300);
       if (texts.length >= 2) { options = texts; break; }
     }
 
-    // ── Hero image ──
-    const heroSelectors = [
-      '[class*="hero"] img', '[class*="banner"] img',
-      '[class*="step-image"] img', '[class*="question-image"] img',
-      'header img',
-    ];
+    const heroSelectors = ['[class*="hero"] img', '[class*="banner"] img', '[class*="step-image"] img', 'header img'];
     let heroImageUrl = null;
     for (const sel of heroSelectors) {
       const img = document.querySelector(sel);
-      if (img?.src && img.src.startsWith('http')) { heroImageUrl = img.src; break; }
+      if (img?.src?.startsWith('http')) { heroImageUrl = img.src; break; }
     }
 
-    // ── Step type detection ──
-    const hasEmailInput = !!document.querySelector(
-      'input[type="email"], input[name*="email" i], input[placeholder*="email" i]'
-    );
-    const hasNameInput = !!document.querySelector(
-      'input[name*="name" i], input[name*="nome" i], input[placeholder*="nome" i]'
-    );
-    const hasForm = hasEmailInput || hasNameInput;
+    const hasEmail = !!document.querySelector('input[type="email"], input[name*="email" i], input[placeholder*="email" i]');
+    const hasName = !!document.querySelector('input[name*="name" i], input[name*="nome" i], input[placeholder*="nome" i]');
+    const hasForm = hasEmail || hasName;
 
     let type = 'content';
-    if (hasForm) {
-      type = 'lead-capture';
-    } else if (options.length >= 2) {
-      type = 'single-choice';
-    }
+    if (hasForm) type = 'lead-capture';
+    else if (options.length >= 2) type = 'single-choice';
 
-    // ── Is end state? ──
     const bodyText = document.body.innerText.toLowerCase();
-    const endKeywords = [
-      'obrigado', 'parabéns', 'resultado', 'thank you', 'thanks',
-      'conclusão', 'finalizado', 'completed', 'uau', 'incrível',
-    ];
+    const endKeywords = ['obrigado', 'parabéns', 'resultado', 'thank you', 'conclusão', 'finalizado'];
     const isEnd = endKeywords.some((k) => bodyText.includes(k)) && options.length === 0;
 
-    // ── Lead fields ──
     let leadFields = [];
     if (hasForm) {
       document.querySelectorAll('input:not([type="hidden"]):not([type="submit"])').forEach((input) => {
-        const label =
-          input.labels?.[0]?.innerText?.trim() ||
-          input.placeholder?.trim() ||
-          input.name || '';
+        const label = input.labels?.[0]?.innerText?.trim() || input.placeholder?.trim() || input.name || '';
         const t = (input.type || '').toLowerCase();
         const n = (input.name || '').toLowerCase();
         const p = (input.placeholder || '').toLowerCase();
         let fieldType = 'custom';
         if (t === 'email' || n.includes('email') || p.includes('email')) fieldType = 'email';
-        else if (n.includes('nome') || n.includes('name') || p.includes('nome') || p.includes('name')) fieldType = 'name';
+        else if (n.includes('nome') || n.includes('name') || p.includes('nome')) fieldType = 'name';
         else if (n.includes('phone') || n.includes('fone') || n.includes('whatsapp') || p.includes('telefone')) fieldType = 'phone';
         leadFields.push({ label, fieldType });
       });
@@ -169,144 +312,117 @@ async function extractCurrentStep(page) {
   });
 }
 
-// Try to advance to the next step — returns true if an action was taken
 async function advanceToNextStep(page, stepData) {
-  // ── For CHOICE steps: click first option, then maybe continue ──
   if (stepData.type === 'single-choice' || stepData.type === 'multiple-choice') {
     const clicked = await page.evaluate(() => {
       const optionSelectors = [
-        '[class*="option"]:not([class*="selected"]):not([disabled])',
-        '[class*="choice"]:not([disabled])',
-        '[class*="answer"]:not([disabled])',
-        '[class*="alternative"]:not([disabled])',
-        '[role="radio"]:not([disabled])',
-        '[role="checkbox"]:not([disabled])',
+        '[class*="option"]:not([class*="selected"]):not([disabled])', '[class*="choice"]:not([disabled])',
+        '[class*="answer"]:not([disabled])', '[role="radio"]:not([disabled])', '[role="checkbox"]:not([disabled])',
       ];
       for (const sel of optionSelectors) {
-        const els = Array.from(document.querySelectorAll(sel));
-        const visible = els.find((el) => {
-          const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0;
+        const el = Array.from(document.querySelectorAll(sel)).find((e) => {
+          const r = e.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
         });
-        if (visible) {
-          visible.click();
-          return true;
-        }
+        if (el) { el.click(); return true; }
       }
       return false;
     });
-
-    if (clicked) {
-      // Wait to see if quiz auto-advanced after clicking option
-      await delay(1200);
-      return true;
-    }
+    if (clicked) await delay(1200);
   }
 
-  // ── For LEAD CAPTURE: fill dummy data and submit ──
   if (stepData.type === 'lead-capture') {
     await page.evaluate(() => {
       document.querySelectorAll('input:not([type="hidden"]):not([type="submit"])').forEach((input) => {
         const t = (input.type || '').toLowerCase();
         const n = (input.name || '').toLowerCase();
         const p = (input.placeholder || '').toLowerCase();
-        if (t === 'email' || n.includes('email') || p.includes('email')) {
-          input.value = 'clone@exemplo.com';
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        } else if (n.includes('nome') || n.includes('name') || p.includes('nome')) {
-          input.value = 'Clone Quiz';
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        } else if (n.includes('phone') || n.includes('fone') || p.includes('telefone') || p.includes('whatsapp')) {
-          input.value = '11999999999';
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        } else {
-          input.value = 'Clone';
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-        }
+        let val = 'Clone';
+        if (t === 'email' || n.includes('email') || p.includes('email')) val = 'clone@exemplo.com';
+        else if (n.includes('nome') || n.includes('name') || p.includes('nome')) val = 'Clone Quiz';
+        else if (n.includes('phone') || n.includes('fone') || p.includes('telefone') || p.includes('whatsapp')) val = '11999999999';
+        input.value = val;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
       });
     });
     await delay(500);
   }
 
-  // ── Click the primary advance button (continue / next / start / submit) ──
   const buttonClicked = await page.evaluate(() => {
-    function isVisible(el) {
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    }
-    function isDisabled(el) {
-      return el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') != null;
-    }
-    function tryClick(el) {
-      if (el && isVisible(el) && !isDisabled(el)) { el.click(); return true; }
-      return false;
-    }
+    function isVisible(el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+    function isDisabled(el) { return el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') != null; }
+    function tryClick(el) { if (el && isVisible(el) && !isDisabled(el)) { el.click(); return true; } return false; }
 
     const skipWords = ['back', 'voltar', 'prev', 'anterior', 'close', 'fechar', 'cancel', 'cancelar', 'skip', 'pular'];
+    const advanceWords = ['começar', 'iniciar', 'continuar', 'avançar', 'próximo', 'next', 'start', 'continue', 'prosseguir', 'enviar', 'submit', 'ok'];
+    const classKws = ['continue', 'continuar', 'next', 'proximo', 'advance', 'start', 'iniciar', 'primary', 'cta', 'submit'];
 
-    // Priority selectors — buttons AND anchors AND divs with role=button
-    const tagPrefixes = ['button', 'a', '[role="button"]', 'div', 'span'];
-    const classKeywords = [
-      'continue', 'continuar', 'next', 'proximo', 'próximo',
-      'advance', 'avancar', 'avançar', 'start', 'comecar', 'começar',
-      'iniciar', 'begin', 'primary', 'btn-main', 'cta', 'submit',
-    ];
-
-    for (const tag of tagPrefixes) {
-      for (const kw of classKeywords) {
-        const el = document.querySelector(`${tag}[class*="${kw}"]`);
-        if (tryClick(el)) return true;
+    for (const tag of ['button', 'a', '[role="button"]']) {
+      for (const kw of classKws) {
+        if (tryClick(document.querySelector(`${tag}[class*="${kw}"]`))) return true;
       }
     }
+    if (tryClick(document.querySelector('button[type="submit"], input[type="submit"]'))) return true;
 
-    // submit inputs/buttons
-    for (const sel of ['button[type="submit"]', 'input[type="submit"]', 'a[type="submit"]']) {
-      if (tryClick(document.querySelector(sel))) return true;
-    }
-
-    // Text-based match on buttons + anchors + role=button elements
-    const candidates = Array.from(document.querySelectorAll(
-      'button:not([disabled]), a[href], [role="button"], [class*="btn"]:not([disabled])'
-    ));
-    const advanceWords = ['começar', 'iniciar', 'continuar', 'avançar', 'próximo', 'next',
-      'start', 'continue', 'prosseguir', 'enviar', 'submit', 'ok'];
-
-    // First: try text-match advance words
+    const candidates = Array.from(document.querySelectorAll('button:not([disabled]), a, [role="button"], [class*="btn"]:not([disabled])'));
     for (const el of candidates) {
       const text = (el.innerText || el.textContent || '').toLowerCase().trim();
       if (advanceWords.some((w) => text.includes(w)) && isVisible(el) && !isDisabled(el)) {
-        el.click();
-        return true;
+        el.click(); return true;
       }
     }
-
-    // Last resort: first visible clickable element not in skip list
     for (const el of candidates) {
       const text = (el.innerText || el.textContent || '').toLowerCase().trim();
       const cls = (el.className || '').toLowerCase();
-      const isBad = skipWords.some((w) => text.includes(w) || cls.includes(w));
-      if (!isBad && isVisible(el) && !isDisabled(el)) {
-        el.click();
-        return true;
+      if (!skipWords.some((w) => text.includes(w) || cls.includes(w)) && isVisible(el) && !isDisabled(el)) {
+        el.click(); return true;
       }
     }
-
     return false;
   });
 
-  if (buttonClicked) {
-    await delay(stepData.type === 'content' ? 3000 : 1500);
-    return true;
-  }
-
+  if (buttonClicked) { await delay(stepData.type === 'content' ? 3000 : 1500); return true; }
   return false;
 }
 
-// ─── Main render + navigate route ─────────────────────────────────────────────
+// ─── Extract visual theme ──────────────────────────────────────────────────────
+async function extractVisual(page) {
+  return page.evaluate(() => {
+    const rootStyle = window.getComputedStyle(document.documentElement);
+    const cssVarNames = ['--primary', '--primary-color', '--color-primary', '--accent-color', '--theme-color', '--button-color', '--brand-color'];
+    const cssVars = {};
+    cssVarNames.forEach((v) => { const val = rootStyle.getPropertyValue(v).trim(); if (val) cssVars[v] = val; });
 
+    const btn = document.querySelector('button:not([disabled])') || document.querySelector('[class*="option"]');
+    const btnStyle = btn ? window.getComputedStyle(btn) : null;
+    const h1 = document.querySelector('h1') || document.querySelector('h2');
+    const fontFamily = (h1 ? window.getComputedStyle(h1) : window.getComputedStyle(document.body)).fontFamily;
+    const logo = document.querySelector('img[class*="logo"], [class*="logo"] img, header img, [class*="header"] img');
+
+    const colorFreq = {};
+    document.querySelectorAll('*').forEach((el) => {
+      const s = window.getComputedStyle(el);
+      [s.backgroundColor, s.color].forEach((c) => {
+        if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent' && c !== 'rgb(0, 0, 0)' && c !== 'rgb(255, 255, 255)') {
+          colorFreq[c] = (colorFreq[c] || 0) + 1;
+        }
+      });
+    });
+    const topColors = Object.entries(colorFreq).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([c]) => c);
+
+    return {
+      cssVars, topColors, fontFamily,
+      primaryButtonBg: btnStyle?.backgroundColor || null,
+      primaryButtonColor: btnStyle?.color || null,
+      primaryButtonRadius: btnStyle?.borderRadius || null,
+      logoUrl: logo?.src || null,
+      title: document.title,
+    };
+  });
+}
+
+// ─── Main render route ─────────────────────────────────────────────────────────
 app.post('/render', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -329,12 +445,12 @@ app.post('/render', async (req, res) => {
     });
 
     const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1');
 
-    await page.setUserAgent(
-      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
-    );
+    // Inject interception code BEFORE page loads
+    await page.evaluateOnNewDocument(INTERCEPT_SCRIPT);
 
-    // Block fonts/media to speed up — keep images and scripts
+    // Block media to speed up
     await page.setRequestInterception(true);
     page.on('request', (r) => {
       if (r.resourceType() === 'media') r.abort();
@@ -342,72 +458,44 @@ app.post('/render', async (req, res) => {
     });
 
     console.log(`[render] Loading: ${parsedUrl}`);
-    await page.goto(parsedUrl.toString(), { waitUntil: 'networkidle0', timeout: 30000 });
+    await page.goto(parsedUrl.toString(), { waitUntil: 'networkidle0', timeout: 45000 });
+    await delay(3000); // Wait for React hydration + AES decrypt
 
-    // Wait for React hydration + possible AES decryption (Inlead)
-    await delay(4000);
-    await waitForStable(page, 6000);
+    const visual = await extractVisual(page);
 
-    console.log('[render] Page ready. Starting step navigation...');
+    // ── Strategy 1: CryptoJS / fetch interception ──
+    const captured = await page.evaluate(() => window.__quizCapture);
+    if (captured?.data) {
+      console.log(`[render] Strategy 1 (${captured.source}): captured quiz data directly`);
+      const mappedSteps = mapCapturedSteps(captured.data);
+      if (mappedSteps && mappedSteps.length > 0) {
+        // Take one screenshot for all steps (no navigation needed)
+        const screenshot = await page.screenshot({ encoding: 'base64', clip: { x: 0, y: 0, width: 390, height: 844 } });
+        const steps = mappedSteps.map((s) => ({ ...s, screenshot }));
 
-    // ── Extract global visual theme (once, from initial state) ──
-    const visual = await page.evaluate(() => {
-      const rootStyle = window.getComputedStyle(document.documentElement);
-      const cssVarNames = [
-        '--primary', '--primary-color', '--color-primary', '--accent-color',
-        '--theme-color', '--theme-featured-color', '--featured-color',
-        '--button-color', '--brand-color', '--main-color',
-      ];
-      const cssVars = {};
-      cssVarNames.forEach((v) => {
-        const val = rootStyle.getPropertyValue(v).trim();
-        if (val) cssVars[v] = val;
-      });
+        console.log(`[render] Done via interception. ${steps.length} steps.`);
+        await browser.close();
+        return res.json({ success: true, steps, visual, title: visual.title || parsedUrl.hostname, summary: `${steps.length} steps captured via data interception` });
+      }
+    }
 
-      const btn = document.querySelector('button:not([disabled])') ||
-        document.querySelector('[class*="option"]');
-      const btnStyle = btn ? window.getComputedStyle(btn) : null;
+    // ── Strategy 2: React fiber extraction ──
+    console.log('[render] Strategy 2: trying React fiber extraction...');
+    const fiberData = await extractFromReactFiber(page);
+    if (fiberData) {
+      const mappedSteps = mapCapturedSteps(fiberData);
+      if (mappedSteps && mappedSteps.length > 0) {
+        const screenshot = await page.screenshot({ encoding: 'base64', clip: { x: 0, y: 0, width: 390, height: 844 } });
+        const steps = mappedSteps.map((s) => ({ ...s, screenshot }));
 
-      const h1 = document.querySelector('h1') || document.querySelector('h2');
-      const fontFamily = (h1 ? window.getComputedStyle(h1) : window.getComputedStyle(document.body)).fontFamily;
+        console.log(`[render] Done via React fiber. ${steps.length} steps.`);
+        await browser.close();
+        return res.json({ success: true, steps, visual, title: visual.title || parsedUrl.hostname, summary: `${steps.length} steps captured via React state` });
+      }
+    }
 
-      const logo = document.querySelector(
-        'img[class*="logo"], [class*="logo"] img, header img, [class*="header"] img'
-      );
-
-      const allImages = Array.from(document.querySelectorAll('img'))
-        .map((img) => ({ src: img.src, w: img.naturalWidth }))
-        .filter((img) => img.src.startsWith('http'))
-        .sort((a, b) => b.w - a.w);
-
-      // Frequency of colors on page
-      const colorFreq = {};
-      document.querySelectorAll('*').forEach((el) => {
-        const s = window.getComputedStyle(el);
-        [s.backgroundColor, s.color].forEach((c) => {
-          if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent' &&
-              c !== 'rgb(0, 0, 0)' && c !== 'rgb(255, 255, 255)') {
-            colorFreq[c] = (colorFreq[c] || 0) + 1;
-          }
-        });
-      });
-      const topColors = Object.entries(colorFreq).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([c]) => c);
-
-      return {
-        cssVars,
-        topColors,
-        fontFamily,
-        primaryButtonBg: btnStyle?.backgroundColor || null,
-        primaryButtonColor: btnStyle?.color || null,
-        primaryButtonRadius: btnStyle?.borderRadius || null,
-        logoUrl: logo?.src || null,
-        backgroundColor: window.getComputedStyle(document.body).backgroundColor,
-        images: allImages.slice(0, 20),
-        title: document.title,
-      };
-    });
-
-    // ── Navigate through ALL steps ──
+    // ── Strategy 3: Puppeteer navigation (universal fallback) ──
+    console.log('[render] Strategy 3: navigating step-by-step...');
     const steps = [];
     const MAX_STEPS = 40;
     let previousSignature = null;
@@ -415,17 +503,11 @@ app.post('/render', async (req, res) => {
 
     for (let i = 0; i < MAX_STEPS; i++) {
       await waitForStable(page, 5000);
-
       const signature = await getCurrentStepSignature(page);
 
-      // Detect if stuck on same step
       if (signature === previousSignature) {
         stuckCount++;
-        if (stuckCount >= 3) {
-          console.log(`[render] Stuck on step ${i}, stopping.`);
-          break;
-        }
-        // Try clicking again with longer wait
+        if (stuckCount >= 3) { console.log(`[render] Stuck at step ${i}, stopping.`); break; }
         await delay(2000);
         await advanceToNextStep(page, steps[steps.length - 1] || { type: 'content' });
         continue;
@@ -433,60 +515,27 @@ app.post('/render', async (req, res) => {
       stuckCount = 0;
       previousSignature = signature;
 
-      // Extract current step data
       const stepData = await extractCurrentStep(page);
       console.log(`[render] Step ${i + 1}: type=${stepData.type} title="${stepData.title?.slice(0, 50)}"`);
 
-      if (!stepData.title && steps.length > 0) {
-        console.log('[render] Empty step, stopping.');
-        break;
-      }
+      if (!stepData.title && steps.length > 0) { console.log('[render] Empty step, stopping.'); break; }
 
-      // Screenshot of this step
-      const screenshot = await page.screenshot({
-        encoding: 'base64',
-        clip: { x: 0, y: 0, width: 390, height: 844 },
-      });
-
+      const screenshot = await page.screenshot({ encoding: 'base64', clip: { x: 0, y: 0, width: 390, height: 844 } });
       steps.push({ ...stepData, screenshot });
 
-      // Stop if this is a known end state
-      if (stepData.isEnd) {
-        console.log(`[render] End state detected at step ${i + 1}.`);
-        break;
-      }
+      if (stepData.isEnd) { console.log(`[render] End state at step ${i + 1}.`); break; }
 
-      // Advance to next step
       const advanced = await advanceToNextStep(page, stepData);
-      if (!advanced) {
-        console.log(`[render] Could not advance from step ${i + 1}, stopping.`);
-        break;
-      }
+      if (!advanced) { console.log(`[render] Could not advance from step ${i + 1}, stopping.`); break; }
 
-      // Extra wait for slow transitions/animations
       await delay(1000);
     }
 
     await browser.close();
     browser = null;
 
-    console.log(`[render] Done. Captured ${steps.length} steps.`);
-
-    // First step HTML for Claude (text content extraction)
-    const firstScreenshotHtml = steps.length > 0
-      ? `Quiz "${visual.title}" com ${steps.length} etapas capturadas:\n` +
-        steps.map((s, i) =>
-          `ETAPA ${i + 1} (${s.type}): "${s.title}" | opções: ${(s.options || []).map(o => o.text).join(', ')}`
-        ).join('\n')
-      : '';
-
-    res.json({
-      success: true,
-      steps, // All steps with individual screenshots
-      visual,
-      title: visual.title || parsedUrl.hostname,
-      summary: firstScreenshotHtml,
-    });
+    console.log(`[render] Done via navigation. ${steps.length} steps.`);
+    res.json({ success: true, steps, visual, title: visual.title || parsedUrl.hostname, summary: `${steps.length} steps captured via navigation` });
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
