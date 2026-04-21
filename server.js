@@ -233,50 +233,72 @@ async function advanceToNextStep(page, stepData) {
 
   // ── Click the primary advance button (continue / next / start / submit) ──
   const buttonClicked = await page.evaluate(() => {
-    // Priority-ordered selectors for "advance" buttons
-    const selectors = [
-      // Explicit continue/next buttons
-      'button[class*="continue"]', 'button[class*="continuar"]',
-      'button[class*="next"]', 'button[class*="proximo"]', 'button[class*="próximo"]',
-      'button[class*="advance"]', 'button[class*="avancar"]', 'button[class*="avançar"]',
-      'button[class*="start"]', 'button[class*="comecar"]', 'button[class*="começar"]',
-      // Submit
-      'button[type="submit"]', 'input[type="submit"]',
-      // Generic primary buttons (last resort)
-      'button[class*="primary"]', 'button[class*="btn-main"]', '[class*="cta"]',
+    function isVisible(el) {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    }
+    function isDisabled(el) {
+      return el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') != null;
+    }
+    function tryClick(el) {
+      if (el && isVisible(el) && !isDisabled(el)) { el.click(); return true; }
+      return false;
+    }
+
+    const skipWords = ['back', 'voltar', 'prev', 'anterior', 'close', 'fechar', 'cancel', 'cancelar', 'skip', 'pular'];
+
+    // Priority selectors — buttons AND anchors AND divs with role=button
+    const tagPrefixes = ['button', 'a', '[role="button"]', 'div', 'span'];
+    const classKeywords = [
+      'continue', 'continuar', 'next', 'proximo', 'próximo',
+      'advance', 'avancar', 'avançar', 'start', 'comecar', 'começar',
+      'iniciar', 'begin', 'primary', 'btn-main', 'cta', 'submit',
     ];
 
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const rect = el.getBoundingClientRect();
-        const isVisible = rect.width > 0 && rect.height > 0;
-        const isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
-        if (isVisible && !isDisabled) {
-          el.click();
-          return true;
-        }
+    for (const tag of tagPrefixes) {
+      for (const kw of classKeywords) {
+        const el = document.querySelector(`${tag}[class*="${kw}"]`);
+        if (tryClick(el)) return true;
       }
     }
 
-    // Last resort: find ANY visible enabled button that's not "back/prev/close"
-    const allButtons = Array.from(document.querySelectorAll('button:not([disabled])'));
-    const skipWords = ['back', 'voltar', 'prev', 'anterior', 'close', 'fechar', 'cancel', 'cancelar'];
-    const candidate = allButtons.find((btn) => {
-      const text = btn.innerText?.toLowerCase() || '';
-      const cls = btn.className?.toLowerCase() || '';
-      const rect = btn.getBoundingClientRect();
-      const isVisible = rect.width > 0 && rect.height > 0;
+    // submit inputs/buttons
+    for (const sel of ['button[type="submit"]', 'input[type="submit"]', 'a[type="submit"]']) {
+      if (tryClick(document.querySelector(sel))) return true;
+    }
+
+    // Text-based match on buttons + anchors + role=button elements
+    const candidates = Array.from(document.querySelectorAll(
+      'button:not([disabled]), a[href], [role="button"], [class*="btn"]:not([disabled])'
+    ));
+    const advanceWords = ['começar', 'iniciar', 'continuar', 'avançar', 'próximo', 'next',
+      'start', 'continue', 'prosseguir', 'enviar', 'submit', 'ok'];
+
+    // First: try text-match advance words
+    for (const el of candidates) {
+      const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+      if (advanceWords.some((w) => text.includes(w)) && isVisible(el) && !isDisabled(el)) {
+        el.click();
+        return true;
+      }
+    }
+
+    // Last resort: first visible clickable element not in skip list
+    for (const el of candidates) {
+      const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+      const cls = (el.className || '').toLowerCase();
       const isBad = skipWords.some((w) => text.includes(w) || cls.includes(w));
-      return isVisible && !isBad;
-    });
-    if (candidate) { candidate.click(); return true; }
+      if (!isBad && isVisible(el) && !isDisabled(el)) {
+        el.click();
+        return true;
+      }
+    }
 
     return false;
   });
 
   if (buttonClicked) {
-    await delay(1500);
+    await delay(stepData.type === 'content' ? 3000 : 1500);
     return true;
   }
 
